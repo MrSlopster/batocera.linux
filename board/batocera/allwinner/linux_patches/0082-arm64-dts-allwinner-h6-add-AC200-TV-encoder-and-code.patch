@@ -1,0 +1,315 @@
+From efefe3f8af38ebe6656e2acaa89a78225636250a Mon Sep 17 00:00:00 2001
+From: Mr Slop Mizer <306584837+MrSlopster@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 17:48:21 +0400
+Subject: [PATCH 82/82] arm64: dts: allwinner: h6: add AC200 TV encoder and
+ codec, Orange Pi 3 CVBS variant
+
+sun50i-h6.dtsi (all new nodes disabled):
+- tcon_lcd0, CCIR656 pins (PB0-PB11), mixer0 -> tcon_lcd0 graph link
+- SID cells for the TV DAC calibration and the AC200 bandgap trim
+- AC200 tv-encoder and codec nodes, i2s3 and the ac200-audio
+  simple-audio-card (codec/i2s3 nodes from Jernej Skrabec's Armbian
+  patches)
+
+sun50i-h6-orangepi-3-cvbs.dts: composite video and analog audio on the
+AV jack. HDMI is disabled since TCON_LCD0 and the HDMI TCON both use
+mixer0. ALDO2 is kept on (it also powers the AC200); the RTL8211E PHY ID
+is given so it gets reset before it is probed, which is needed when ALDO2
+is already up.
+---
+ arch/arm64/boot/dts/allwinner/Makefile        |   1 +
+ .../allwinner/sun50i-h6-orangepi-3-cvbs.dts   |  87 +++++++++++++
+ arch/arm64/boot/dts/allwinner/sun50i-h6.dtsi  | 123 ++++++++++++++++++
+ 3 files changed, 211 insertions(+)
+ create mode 100644 arch/arm64/boot/dts/allwinner/sun50i-h6-orangepi-3-cvbs.dts
+
+diff --git a/arch/arm64/boot/dts/allwinner/Makefile b/arch/arm64/boot/dts/allwinner/Makefile
+index 668f26d4d..967d5f322 100644
+--- a/arch/arm64/boot/dts/allwinner/Makefile
++++ b/arch/arm64/boot/dts/allwinner/Makefile
+@@ -32,6 +32,7 @@ dtb-$(CONFIG_ARCH_SUNXI) += sun50i-h5-orangepi-zero-plus.dtb
+ dtb-$(CONFIG_ARCH_SUNXI) += sun50i-h5-orangepi-zero-plus2.dtb
+ dtb-$(CONFIG_ARCH_SUNXI) += sun50i-h6-beelink-gs1.dtb
+ dtb-$(CONFIG_ARCH_SUNXI) += sun50i-h6-orangepi-3.dtb
++dtb-$(CONFIG_ARCH_SUNXI) += sun50i-h6-orangepi-3-cvbs.dtb
+ dtb-$(CONFIG_ARCH_SUNXI) += sun50i-h6-orangepi-3-lts.dtb
+ dtb-$(CONFIG_ARCH_SUNXI) += sun50i-h6-orangepi-lite2.dtb
+ dtb-$(CONFIG_ARCH_SUNXI) += sun50i-h6-orangepi-one-plus.dtb
+diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h6-orangepi-3-cvbs.dts b/arch/arm64/boot/dts/allwinner/sun50i-h6-orangepi-3-cvbs.dts
+new file mode 100644
+index 000000000..5751ca1a2
+--- /dev/null
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h6-orangepi-3-cvbs.dts
+@@ -0,0 +1,87 @@
++// SPDX-License-Identifier: (GPL-2.0+ or MIT)
++/*
++ * Orange Pi 3 with the composite (CVBS) output on the AV jack enabled.
++ *
++ * The CVBS signal comes from the TV encoder in the co-packaged AC200,
++ * fed by TCON_LCD0 over CCIR656. TCON_LCD0 and the HDMI TCON both hang off
++ * mixer0, so HDMI is disabled in this variant.
++ */
++
++#include "sun50i-h6-orangepi-3.dts"
++
++/ {
++	model = "OrangePi 3 (CVBS)";
++};
++
++&hdmi {
++	status = "disabled";
++};
++
++&tcon_tv {
++	status = "disabled";
++};
++
++&tcon_lcd0 {
++	status = "okay";
++};
++
++&pwm {
++	status = "okay";
++};
++
++&ac200_pwm_clk {
++	status = "okay";
++};
++
++&i2c3 {
++	status = "okay";
++};
++
++&ac200_tve {
++	status = "okay";
++};
++
++/*
++ * reg_aldo2 (vcc33-audio-tv-ephy-mac) also powers the AC200, which must be
++ * up before the AC200 is probed over I2C (otherwise it NAKs: -ETIMEDOUT).
++ * The stock DT relies on aldo2's enable ramp to give the RTL8211E PHY its
++ * 100ms power-up delay, which is skipped whenever aldo2 is already on (here,
++ * but also after any warm reboot). Move that delay to the other PHY rail.
++ */
++&reg_aldo2 {
++	regulator-always-on;
++};
++
++&reg_gmac_2v5 {
++	startup-delay-us = <100000>;
++};
++
++/*
++ * With aldo2 already up (always-on above, or after a warm reboot) the
++ * RTL8211E does not answer until it has been reset. Giving its ID here
++ * skips the ID read that otherwise happens before the reset GPIO is
++ * pulsed, so the PHY is reset first.
++ */
++&ext_rgmii_phy {
++	compatible = "ethernet-phy-id001c.c915",
++		     "ethernet-phy-ieee802.3-c22";
++};
++
++/* Analog audio on the AV jack: H6 I2S3 -> AC200 codec */
++&ac200_codec {
++	avcc-supply = <&reg_aldo2>;
++	status = "okay";
++};
++
++&i2s3 {
++	status = "okay";
++};
++
++&analog {
++	status = "okay";
++};
++
++/* HDMI is off, so is its audio card */
++&sound_hdmi {
++	status = "disabled";
++};
+diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h6.dtsi b/arch/arm64/boot/dts/allwinner/sun50i-h6.dtsi
+index 1fec11dff..26db2b881 100644
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h6.dtsi
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h6.dtsi
+@@ -17,6 +17,22 @@ / {
+ 	#address-cells = <1>;
+ 	#size-cells = <1>;
+ 
++	analog: analog-codec {
++		compatible = "simple-audio-card";
++		simple-audio-card,format = "i2s";
++		simple-audio-card,name = "ac200-audio";
++		simple-audio-card,mclk-fs = <512>;
++		status = "disabled";
++
++		simple-audio-card,cpu {
++			sound-dai = <&i2s3>;
++		};
++
++		simple-audio-card,codec {
++			sound-dai = <&ac200_codec>;
++		};
++	};
++
+ 	ac200_pwm_clk: ac200_clk {
+ 		compatible = "pwm-clock";
+ 		#clock-cells = <0>;
+@@ -346,6 +362,19 @@ cpu_speed_grade: cpu-speed-grade@1c {
+ 			ephy_calib: ephy_calib@2c {
+ 				reg = <0x2c 0x2>;
+ 			};
++
++			/*
++			 * TV DAC calibration is the upper 16 bits of this word
++			 * (offset 0x2e), which is not aligned to the SID's
++			 * 4-byte stride, so the whole word is exposed.
++			 */
++			tve_calib: tve-calib@2c {
++				reg = <0x2c 0x4>;
++			};
++
++			ac200_bandgap: ac200-bandgap@30 {
++				reg = <0x30 0x2>;
++			};
+ 		};
+ 
+ 		timer@3009000 {
+@@ -427,6 +456,18 @@ i2c2_pins: i2c2-pins {
+ 				function = "i2c2";
+ 			};
+ 
++			ccir_pins: ccir-pins {
++				pins = "PB0", "PB1", "PB2", "PB3", "PB4",
++				       "PB5", "PB6", "PB7", "PB8", "PB9",
++				       "PB10", "PB11";
++				function = "ccir";
++			};
++
++			i2s3_pins: i2s3-pins {
++				pins = "PB12", "PB13", "PB14", "PB15", "PB16";
++				function = "i2s3";
++			};
++
+ 			i2c3_pins: i2c3-pins {
+ 				pins = "PB17", "PB18";
+ 				function = "i2c3";
+@@ -713,12 +754,33 @@ ac200: mfd@10 {
+ 				compatible = "x-powers,ac200";
+ 				reg = <0x10>;
+ 				clocks = <&ac200_pwm_clk>;
++				nvmem-cells = <&ac200_bandgap>;
++				nvmem-cell-names = "bandgap";
+ 
+ 				ac200_ephy: phy {
+ 					compatible = "x-powers,ac200-ephy";
+ 					nvmem-cells = <&ephy_calib>;
+ 					nvmem-cell-names = "ephy_calib";
+ 				};
++
++				ac200_codec: codec {
++					#sound-dai-cells = <0>;
++					compatible = "x-powers,ac200-codec";
++					status = "disabled";
++				};
++
++				ac200_tve: tv-encoder {
++					compatible = "x-powers,ac200-tve";
++					nvmem-cells = <&tve_calib>;
++					nvmem-cell-names = "tve_calib";
++					status = "disabled";
++
++					port {
++						ac200_tve_in_tcon_lcd0: endpoint {
++							remote-endpoint = <&tcon_lcd0_out_ac200_tve>;
++						};
++					};
++				};
+ 			};
+ 		};
+ 
+@@ -742,6 +804,21 @@ mdio: mdio {
+ 			};
+ 		};
+ 
++		i2s3: i2s@508f000 {
++			#sound-dai-cells = <0>;
++			compatible = "allwinner,sun50i-h6-i2s";
++			reg = <0x0508f000 0x1000>;
++			interrupts = <GIC_SPI 30 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_I2S3>, <&ccu CLK_I2S3>;
++			clock-names = "apb", "mod";
++			dmas = <&dma 6>, <&dma 6>;
++			resets = <&ccu RST_BUS_I2S3>;
++			dma-names = "rx", "tx";
++			pinctrl-names = "default";
++			pinctrl-0 = <&i2s3_pins>;
++			status = "disabled";
++		};
++
+ 		i2s1: i2s@5091000 {
+ 			#sound-dai-cells = <0>;
+ 			compatible = "allwinner,sun50i-h6-i2s";
+@@ -963,6 +1040,11 @@ tcon_top_mixer0_out: port@1 {
+ 					#size-cells = <0>;
+ 					reg = <1>;
+ 
++					tcon_top_mixer0_out_tcon_lcd0: endpoint@0 {
++						reg = <0>;
++						remote-endpoint = <&tcon_lcd0_in_tcon_top_mixer0>;
++					};
++
+ 					tcon_top_mixer0_out_tcon_tv: endpoint@2 {
+ 						reg = <2>;
+ 						remote-endpoint = <&tcon_tv_in_tcon_top_mixer0>;
+@@ -990,6 +1072,47 @@ tcon_top_hdmi_out_hdmi: endpoint {
+ 			};
+ 		};
+ 
++		tcon_lcd0: lcd-controller@6511000 {
++			compatible = "allwinner,sun50i-h6-tcon-lcd";
++			reg = <0x06511000 0x1000>;
++			interrupts = <GIC_SPI 65 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_TCON_LCD0>,
++				 <&ccu CLK_TCON_LCD0>;
++			clock-names = "ahb",
++				      "tcon-ch0";
++			clock-output-names = "tcon-data-clock";
++			#clock-cells = <0>;
++			resets = <&ccu RST_BUS_TCON_LCD0>;
++			reset-names = "lcd";
++			pinctrl-names = "default";
++			pinctrl-0 = <&ccir_pins>;
++			status = "disabled";
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				tcon_lcd0_in: port@0 {
++					reg = <0>;
++
++					tcon_lcd0_in_tcon_top_mixer0: endpoint {
++						remote-endpoint = <&tcon_top_mixer0_out_tcon_lcd0>;
++					};
++				};
++
++				tcon_lcd0_out: port@1 {
++					#address-cells = <1>;
++					#size-cells = <0>;
++					reg = <1>;
++
++					tcon_lcd0_out_ac200_tve: endpoint@0 {
++						reg = <0>;
++						remote-endpoint = <&ac200_tve_in_tcon_lcd0>;
++					};
++				};
++			};
++		};
++
+ 		tcon_tv: lcd-controller@6515000 {
+ 			compatible = "allwinner,sun50i-h6-tcon-tv",
+ 				     "allwinner,sun8i-r40-tcon-tv";
+-- 
+2.56.0
+

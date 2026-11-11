@@ -28,7 +28,7 @@ BR2_LINUX_KERNEL_NEEDS_HOST_OPENSSL=y
 
 # Build the DTB from the kernel sources
 BR2_LINUX_KERNEL_DTS_SUPPORT=y
-BR2_LINUX_KERNEL_INTREE_DTS_NAME="allwinner/sun50i-h6-orangepi-3-lts allwinner/sun50i-h6-orangepi-3 allwinner/sun50i-h6-orangepi-one-plus"
+BR2_LINUX_KERNEL_INTREE_DTS_NAME="allwinner/sun50i-h6-orangepi-3-lts allwinner/sun50i-h6-orangepi-3 allwinner/sun50i-h6-orangepi-3-cvbs allwinner/sun50i-h6-orangepi-one-plus"
 
 # GPU
 BR2_PACKAGE_BATOCERA_PANFROST_MESA3D=y

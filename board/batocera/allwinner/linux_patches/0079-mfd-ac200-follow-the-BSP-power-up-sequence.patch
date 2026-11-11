@@ -1,0 +1,106 @@
+From c6a213aa6854adb51dec115d22af841e835f190f Mon Sep 17 00:00:00 2001
+From: Mr Slop Mizer <306584837+MrSlopster@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 17:48:21 +0400
+Subject: [PATCH 79/82] mfd: ac200: follow the BSP power-up sequence
+
+Wait for the 24 MHz clock to settle and program the bandgap trim from
+the H6 SID before enabling the chip, as the Allwinner BSP does.
+Without this the AC200 often does not answer on I2C right after boot.
+---
+ drivers/mfd/ac200.c       | 45 ++++++++++++++++++++++++++++++++++++++-
+ include/linux/mfd/ac200.h |  1 +
+ 2 files changed, 45 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/mfd/ac200.c b/drivers/mfd/ac200.c
+index 07c6497c1..0952fdbd5 100644
+--- a/drivers/mfd/ac200.c
++++ b/drivers/mfd/ac200.c
+@@ -12,12 +12,15 @@
+  * Copyright (2016) Chen-Yu Tsai
+  */
+ 
++#include <linux/delay.h>
+ #include <linux/i2c.h>
+ #include <linux/kernel.h>
+ #include <linux/mfd/core.h>
+ #include <linux/mfd/ac200.h>
+ #include <linux/module.h>
++#include <linux/nvmem-consumer.h>
+ #include <linux/of.h>
++#include <linux/slab.h>
+ 
+ static const struct regmap_range_cfg ac200_range_cfg[] = {
+ 	{
+@@ -58,6 +61,36 @@ static struct mfd_cell ac200_cells[] = {
+ 	},
+ };
+ 
++/*
++ * The BSP programs a bandgap trim value from the SoC eFuse before enabling
++ * the chip; it sets the reference for the analog blocks (TV DAC, codec).
++ */
++static void ac200_set_bandgap(struct device *dev, struct regmap *regmap)
++{
++	struct nvmem_cell *cell;
++	size_t len;
++	u8 *buf;
++	u16 val;
++
++	cell = nvmem_cell_get(dev, "bandgap");
++	if (IS_ERR(cell))
++		return;
++
++	buf = nvmem_cell_read(cell, &len);
++	nvmem_cell_put(cell);
++	if (IS_ERR(buf))
++		return;
++
++	val = len >= 2 ? buf[0] | (buf[1] << 8) : 0;
++	kfree(buf);
++	if (!val)
++		return;
++
++	regmap_write(regmap, AC200_SYS_BG_CTL, val | 0x8000 | (0xa << 6));
++	dev_info(dev, "Bandgap trim 0x%x\n", val);
++	msleep(120);
++}
++
+ static int ac200_i2c_probe(struct i2c_client *i2c)
+ {
+ 	struct device *dev = &i2c->dev;
+@@ -88,9 +121,19 @@ static int ac200_i2c_probe(struct i2c_client *i2c)
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * The chip needs its 24 MHz clock running for a while before it
++	 * responds on I2C. The BSP waits 40 ms here.
++	 */
++	msleep(40);
++
++	ac200_set_bandgap(dev, ac200->regmap);
++
+ 	ret = regmap_write(ac200->regmap, AC200_SYS_CONTROL, 0);
+-	if (ret)
++	if (ret) {
++		dev_err(dev, "Can't access AC200: %d\n", ret);
+ 		goto err;
++	}
+ 
+ 	ret = regmap_write(ac200->regmap, AC200_SYS_CONTROL, 1);
+ 	if (ret)
+diff --git a/include/linux/mfd/ac200.h b/include/linux/mfd/ac200.h
+index 48a21d5c3..f59a1286d 100644
+--- a/include/linux/mfd/ac200.h
++++ b/include/linux/mfd/ac200.h
+@@ -31,6 +31,7 @@
+ #define AC200_SYS_EPHY_CTL1		0x0016
+ #define AC200_SYS_TVE_CTL0		0x0018
+ #define AC200_SYS_TVE_CTL1		0x001A
++#define AC200_SYS_BG_CTL		0x0050
+ 
+ /* Audio Codec registers */
+ #define AC200_AC_SYS_CLK_CTL		0x2000
+-- 
+2.56.0
+

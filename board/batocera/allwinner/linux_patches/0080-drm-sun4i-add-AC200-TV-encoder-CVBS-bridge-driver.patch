@@ -1,0 +1,468 @@
+From 1ac46f588f87df01c4bff0fb4b8f8f2f390725f7 Mon Sep 17 00:00:00 2001
+From: Mr Slop Mizer <306584837+MrSlopster@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 17:48:21 +0400
+Subject: [PATCH 80/82] drm/sun4i: add AC200 TV encoder (CVBS) bridge driver
+
+DRM bridge for the composite video encoder in the X-Powers AC200,
+registered as a child of the AC200 MFD. Provides a Composite connector
+with NTSC 720x480 (default) and PAL 720x576 modes (module parameter
+default_pal), using the register sequences of the Allwinner BSP and the
+DAC calibration value from the H6 SID.
+---
+ drivers/gpu/drm/sun4i/Kconfig            |  11 +
+ drivers/gpu/drm/sun4i/Makefile           |   1 +
+ drivers/gpu/drm/sun4i/sun50i_ac200_tve.c | 411 +++++++++++++++++++++++
+ 3 files changed, 423 insertions(+)
+ create mode 100644 drivers/gpu/drm/sun4i/sun50i_ac200_tve.c
+
+diff --git a/drivers/gpu/drm/sun4i/Kconfig b/drivers/gpu/drm/sun4i/Kconfig
+index 4dac2dddf..119e88bf2 100644
+--- a/drivers/gpu/drm/sun4i/Kconfig
++++ b/drivers/gpu/drm/sun4i/Kconfig
+@@ -76,6 +76,17 @@ config DRM_SUN8I_MIXER
+ 	  graphics mixture and feed graphics to TCON, If M is
+ 	  selected the module will be called sun8i-mixer.
+ 
++config DRM_SUN50I_AC200_TVE
++	tristate "Support for the X-Powers AC200 TV encoder"
++	depends on MFD_AC200
++	depends on DRM_SUN4I
++	select DRM_KMS_HELPER
++	help
++	  Choose this option if you want to enable the composite video
++	  (CVBS) output of the AC200 chip co-packaged with the Allwinner H6.
++	  It is fed by the H6 TCON_LCD0 over a CCIR656 interface.
++	  If M is selected the module will be called sun50i_ac200_tve.
++
+ config DRM_SUN8I_TCON_TOP
+ 	tristate
+ 	default DRM_SUN4I if DRM_SUN8I_MIXER!=n
+diff --git a/drivers/gpu/drm/sun4i/Makefile b/drivers/gpu/drm/sun4i/Makefile
+index 78290f166..d117d444f 100644
+--- a/drivers/gpu/drm/sun4i/Makefile
++++ b/drivers/gpu/drm/sun4i/Makefile
+@@ -39,3 +39,4 @@ obj-$(CONFIG_DRM_SUN6I_DSI)	+= sun6i_mipi_dsi.o
+ obj-$(CONFIG_DRM_SUN8I_DW_HDMI)	+= sun8i-drm-hdmi.o
+ obj-$(CONFIG_DRM_SUN8I_MIXER)	+= sun8i-mixer.o
+ obj-$(CONFIG_DRM_SUN8I_TCON_TOP) += sun8i_tcon_top.o
++obj-$(CONFIG_DRM_SUN50I_AC200_TVE) += sun50i_ac200_tve.o
+diff --git a/drivers/gpu/drm/sun4i/sun50i_ac200_tve.c b/drivers/gpu/drm/sun4i/sun50i_ac200_tve.c
+new file mode 100644
+index 000000000..b9503c3fd
+--- /dev/null
++++ b/drivers/gpu/drm/sun4i/sun50i_ac200_tve.c
+@@ -0,0 +1,411 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * X-Powers AC200 TV encoder (CVBS) driver, as found co-packaged with the
++ * Allwinner H6. The TVE is fed by the H6 TCON_LCD0 over a CCIR656 (BT.656)
++ * interface and is controlled through the AC200 I2C regmap.
++ *
++ * Register sequences are taken from the Allwinner BSP (tv_ac200_lowlevel.c)
++ * and verified against register dumps of the BSP kernel running on an
++ * Orange Pi 3.
++ */
++
++#include <linux/media-bus-format.h>
++#include <linux/mfd/ac200.h>
++#include <linux/module.h>
++#include <linux/nvmem-consumer.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/slab.h>
++#include <asm/unaligned.h>
++
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_bridge.h>
++#include <drm/drm_connector.h>
++#include <drm/drm_modes.h>
++#include <drm/drm_print.h>
++#include <drm/drm_probe_helper.h>
++
++#define AC200_TVE_DAC_CALIB		0x4306
++#define AC200_TVE_DAC_CALIB_DEFAULT	0x28f
++
++struct ac200_reg_seq {
++	u16 reg;
++	u16 val;
++};
++
++struct ac200_tve {
++	struct device		*dev;
++	struct regmap		*regmap;
++	struct drm_bridge	bridge;
++	struct drm_connector	connector;
++	u16			dac_calib;
++	bool			pal;
++};
++
++static bool default_pal;
++module_param(default_pal, bool, 0644);
++MODULE_PARM_DESC(default_pal, "Make PAL (576 lines) the preferred mode instead of NTSC");
++
++/*
++ * The modes are described as progressive modes at twice the TV pixel rate
++ * (27 MHz); the TCON generates the interlaced CCIR656 stream from them.
++ */
++static const struct drm_display_mode ac200_tve_mode_ntsc = {
++	DRM_MODE("720x480", DRM_MODE_TYPE_DRIVER, 27000,
++		 720, 739, 801, 858, 0,
++		 480, 488, 494, 525, 0,
++		 DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_NVSYNC),
++};
++
++static const struct drm_display_mode ac200_tve_mode_pal = {
++	DRM_MODE("720x576", DRM_MODE_TYPE_DRIVER, 27000,
++		 720, 732, 795, 864, 0,
++		 576, 580, 586, 625, 0,
++		 DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_NVSYNC),
++};
++
++static const struct ac200_reg_seq ac200_tve_ntsc_seq[] = {
++	{ 0x4002, 0x8000 }, { 0x4004, 0x0000 }, { 0x4006, 0x0707 },
++	{ 0x400a, 0x4300 }, { 0x400c, 0x1400 }, { 0x400e, 0x3000 },
++	{ 0x4010, 0x7c1f }, { 0x4012, 0x21f0 }, { 0x4014, 0x0020 },
++	{ 0x4016, 0x0076 }, { 0x4018, 0x0016 }, { 0x401a, 0x0000 },
++	{ 0x401c, 0x020d }, { 0x401e, 0x0016 }, { 0x4020, 0x011a },
++	{ 0x4022, 0x00f0 }, { 0x4100, 0x0001 }, { 0x4102, 0x0000 },
++	{ 0x4104, 0x0000 }, { 0x4106, 0x0000 }, { 0x4108, 0x0002 },
++	{ 0x410a, 0x0000 }, { 0x410c, 0x004f }, { 0x410e, 0x0000 },
++	{ 0x4110, 0x0000 }, { 0x4112, 0x0000 }, { 0x4114, 0x447e },
++	{ 0x4116, 0x0016 }, { 0x4118, 0xa0a0 }, { 0x411a, 0x0000 },
++	{ 0x411c, 0x00f0 }, { 0x411e, 0x0010 }, { 0x4120, 0x0320 },
++	{ 0x4122, 0x01e8 }, { 0x4124, 0x05a0 }, { 0x4126, 0x0000 },
++	{ 0x4128, 0x0000 }, { 0x412a, 0x0001 }, { 0x412c, 0x0101 },
++	{ 0x412e, 0x0000 }, { 0x4134, 0x0000 }, { 0x4136, 0x0000 },
++	{ 0x4138, 0x0000 }, { 0x413a, 0x0000 }, { 0x413c, 0x0000 },
++	{ 0x413e, 0x0000 }, { 0x5014, 0x0100 }, { 0x4130, 0x0000 },
++	{ 0x4132, 0x2004 }, { 0x4000, 0x0300 },
++};
++
++static const struct ac200_reg_seq ac200_tve_pal_seq[] = {
++	{ 0x4002, 0x8000 }, { 0x4004, 0x0001 }, { 0x4006, 0x0707 },
++	{ 0x400a, 0x4300 }, { 0x400c, 0x1400 }, { 0x400e, 0x3000 },
++	{ 0x4010, 0x8acb }, { 0x4012, 0x2a09 }, { 0x4014, 0x0018 },
++	{ 0x4016, 0x008a }, { 0x4018, 0x0016 }, { 0x401a, 0x0000 },
++	{ 0x401c, 0x0271 }, { 0x401e, 0x0016 }, { 0x4020, 0x00fc },
++	{ 0x4022, 0x00fc }, { 0x4100, 0x0000 }, { 0x4102, 0x0000 },
++	{ 0x4104, 0x0001 }, { 0x4106, 0x0000 }, { 0x4108, 0x0005 },
++	{ 0x410a, 0x0000 }, { 0x410c, 0x2929 }, { 0x410e, 0x0000 },
++	{ 0x4110, 0x0000 }, { 0x4112, 0x0000 }, { 0x4114, 0x447e },
++	{ 0x4116, 0x0016 }, { 0x4118, 0xabab }, { 0x411a, 0x0000 },
++	{ 0x411c, 0x00fc }, { 0x411e, 0x0010 }, { 0x4120, 0x0320 },
++	{ 0x4122, 0x01e8 }, { 0x4124, 0x05a0 }, { 0x4126, 0x0000 },
++	{ 0x4128, 0x0000 }, { 0x412a, 0x0001 }, { 0x412c, 0x0101 },
++	{ 0x412e, 0x0000 }, { 0x4134, 0x0000 }, { 0x4136, 0x0000 },
++	{ 0x4138, 0x0000 }, { 0x413a, 0x0000 }, { 0x413c, 0x0000 },
++	{ 0x413e, 0x0000 }, { 0x43a0, 0x0001 }, { 0x43a2, 0x0003 },
++	{ 0x5014, 0x2149 }, { 0x4130, 0x0380 }, { 0x4132, 0x2009 },
++	{ 0x4000, 0x0300 },
++};
++
++static inline struct ac200_tve *bridge_to_tve(struct drm_bridge *bridge)
++{
++	return container_of(bridge, struct ac200_tve, bridge);
++}
++
++static inline struct ac200_tve *connector_to_tve(struct drm_connector *conn)
++{
++	return container_of(conn, struct ac200_tve, connector);
++}
++
++static int ac200_tve_write_seq(struct ac200_tve *tve,
++			       const struct ac200_reg_seq *seq, int len)
++{
++	int i, ret;
++
++	for (i = 0; i < len; i++) {
++		ret = regmap_write(tve->regmap, seq[i].reg, seq[i].val);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++static int ac200_tve_hw_init(struct ac200_tve *tve)
++{
++	u16 cal = tve->dac_calib;
++	const struct ac200_reg_seq init_seq[] = {
++		/* clocks for the TVE */
++		{ AC200_SYS_TVE_CTL1, 0x0003 },
++		{ 0x0040, 0x0702 },
++		{ AC200_SYS_PLL_CTL0, 0x4e01 },
++		{ AC200_SYS_PLL_CTL0, 0xce01 },
++		{ AC200_SYS_TVE_CTL0, 0x0001 },
++		{ AC200_SYS_TVE_CTL0, 0x000f },
++		/* DAC calibration */
++		{ AC200_TVE_DAC_CALIB, cal == 0 ? AC200_TVE_DAC_CALIB_DEFAULT :
++				       cal < 0x3f5 ? cal + 10 : cal },
++		/* plug detection setup */
++		{ AC200_TVE_DAC_CFG0, 0x12a0 },
++		{ AC200_TVE_DAC_CFG1, 0x4300 },
++		{ AC200_TVE_PLUG_PULSE_LEVEL, 0x0230 },
++		{ AC200_TVE_PLUG_PULSE_START, 0x0064 },
++		{ AC200_TVE_PLUG_PULSE_PERIOD, 0x0c80 },
++		{ AC200_TVE_PLUG_DEBOUNCE, 0x000f },
++		{ AC200_TVE_PLUG_EN, 0x0001 },
++	};
++
++	return ac200_tve_write_seq(tve, init_seq, ARRAY_SIZE(init_seq));
++}
++
++static int ac200_tve_set_mode(struct ac200_tve *tve,
++			      const struct drm_display_mode *mode)
++{
++	u32 hbp = (mode->htotal - mode->hsync_start) * 2;
++	u32 vbp = (mode->vtotal - mode->vsync_start) / 2;
++	const struct ac200_reg_seq if_seq[] = {
++		/* CCIR656 input interface timings */
++		{ AC200_TVE_IF_CTL, 0x0000 },
++		{ AC200_TVE_IF_TIM0, hbp - 1 },
++		{ AC200_TVE_IF_TIM1, mode->hdisplay * 2 - 1 },
++		{ AC200_TVE_IF_TIM2, vbp - 1 },
++		{ AC200_TVE_IF_TIM3, mode->vdisplay - 1 },
++		{ AC200_TVE_IF_TIM4, vbp - 1 },
++		{ AC200_TVE_IF_SYNC0, 0x0000 },
++		{ AC200_TVE_IF_SYNC1, 0x0004 },
++	};
++	int ret;
++
++	ret = ac200_tve_write_seq(tve, if_seq, ARRAY_SIZE(if_seq));
++	if (ret)
++		return ret;
++
++	if (tve->pal)
++		return ac200_tve_write_seq(tve, ac200_tve_pal_seq,
++					   ARRAY_SIZE(ac200_tve_pal_seq));
++
++	return ac200_tve_write_seq(tve, ac200_tve_ntsc_seq,
++				   ARRAY_SIZE(ac200_tve_ntsc_seq));
++}
++
++static int ac200_tve_connector_get_modes(struct drm_connector *connector)
++{
++	struct ac200_tve *tve = connector_to_tve(connector);
++	const struct drm_display_mode *modes[] = {
++		&ac200_tve_mode_ntsc, &ac200_tve_mode_pal,
++	};
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(modes); i++) {
++		struct drm_display_mode *mode;
++
++		mode = drm_mode_duplicate(connector->dev, modes[i]);
++		if (!mode) {
++			dev_err(tve->dev, "Failed to duplicate mode\n");
++			continue;
++		}
++
++		if ((modes[i] == &ac200_tve_mode_pal) == default_pal)
++			mode->type |= DRM_MODE_TYPE_PREFERRED;
++
++		drm_mode_set_name(mode);
++		drm_mode_probed_add(connector, mode);
++	}
++
++	/* 4:3 picture on a 720 pixel wide line */
++	connector->display_info.width_mm = 400;
++	connector->display_info.height_mm = 300;
++
++	return i;
++}
++
++static const struct drm_connector_helper_funcs ac200_tve_connector_helper_funcs = {
++	.get_modes = ac200_tve_connector_get_modes,
++};
++
++static enum drm_connector_status
++ac200_tve_connector_detect(struct drm_connector *connector, bool force)
++{
++	/*
++	 * The TVE has load detection, but it is only valid while the DAC is
++	 * running. Report the output as always connected, like the BSP does
++	 * for a fixed CVBS output.
++	 */
++	return connector_status_connected;
++}
++
++static const struct drm_connector_funcs ac200_tve_connector_funcs = {
++	.detect			= ac200_tve_connector_detect,
++	.fill_modes		= drm_helper_probe_single_connector_modes,
++	.destroy		= drm_connector_cleanup,
++	.reset			= drm_atomic_helper_connector_reset,
++	.atomic_duplicate_state	= drm_atomic_helper_connector_duplicate_state,
++	.atomic_destroy_state	= drm_atomic_helper_connector_destroy_state,
++};
++
++static int ac200_tve_bridge_attach(struct drm_bridge *bridge,
++				   enum drm_bridge_attach_flags flags)
++{
++	struct ac200_tve *tve = bridge_to_tve(bridge);
++	const u32 bus_format = MEDIA_BUS_FMT_UYVY8_2X8;
++	int ret;
++
++	if (flags & DRM_BRIDGE_ATTACH_NO_CONNECTOR) {
++		dev_err(tve->dev, "Connector-less attach is not supported\n");
++		return -EINVAL;
++	}
++
++	drm_connector_helper_add(&tve->connector,
++				 &ac200_tve_connector_helper_funcs);
++	ret = drm_connector_init(bridge->dev, &tve->connector,
++				 &ac200_tve_connector_funcs,
++				 DRM_MODE_CONNECTOR_Composite);
++	if (ret) {
++		dev_err(tve->dev, "Failed to initialize connector\n");
++		return ret;
++	}
++
++	/* Tells the TCON to use its CCIR656 output mode */
++	ret = drm_display_info_set_bus_formats(&tve->connector.display_info,
++					       &bus_format, 1);
++	if (ret)
++		return ret;
++
++	tve->connector.interlace_allowed = false;
++
++	return drm_connector_attach_encoder(&tve->connector, bridge->encoder);
++}
++
++static enum drm_mode_status
++ac200_tve_bridge_mode_valid(struct drm_bridge *bridge,
++			    const struct drm_display_info *info,
++			    const struct drm_display_mode *mode)
++{
++	if (drm_mode_match(mode, &ac200_tve_mode_ntsc, DRM_MODE_MATCH_TIMINGS |
++			   DRM_MODE_MATCH_CLOCK) ||
++	    drm_mode_match(mode, &ac200_tve_mode_pal, DRM_MODE_MATCH_TIMINGS |
++			   DRM_MODE_MATCH_CLOCK))
++		return MODE_OK;
++
++	return MODE_BAD;
++}
++
++static void ac200_tve_bridge_mode_set(struct drm_bridge *bridge,
++				      const struct drm_display_mode *mode,
++				      const struct drm_display_mode *adj)
++{
++	struct ac200_tve *tve = bridge_to_tve(bridge);
++
++	tve->pal = adj->vtotal == 625;
++}
++
++static void ac200_tve_bridge_enable(struct drm_bridge *bridge)
++{
++	struct ac200_tve *tve = bridge_to_tve(bridge);
++	struct drm_display_mode *mode;
++	int ret;
++
++	mode = &bridge->encoder->crtc->state->adjusted_mode;
++
++	ret = ac200_tve_hw_init(tve);
++	if (!ret)
++		ret = ac200_tve_set_mode(tve, mode);
++	/* Enable the DAC and the encoder */
++	if (!ret)
++		ret = regmap_write(tve->regmap, AC200_TVE_DAC_CFG0, 0x02a1);
++	if (!ret)
++		ret = regmap_write(tve->regmap, AC200_TVE_CTL0, 0x0301);
++
++	if (ret)
++		dev_err(tve->dev, "Failed to enable TVE: %d\n", ret);
++	else
++		dev_info(tve->dev, "TVE enabled in %s mode\n",
++			tve->pal ? "PAL" : "NTSC");
++}
++
++static void ac200_tve_bridge_disable(struct drm_bridge *bridge)
++{
++	struct ac200_tve *tve = bridge_to_tve(bridge);
++
++	regmap_write(tve->regmap, AC200_TVE_CTL0, 0x0300);
++	regmap_write(tve->regmap, AC200_TVE_DAC_CFG0, 0x02a0);
++}
++
++static const struct drm_bridge_funcs ac200_tve_bridge_funcs = {
++	.attach		= ac200_tve_bridge_attach,
++	.mode_valid	= ac200_tve_bridge_mode_valid,
++	.mode_set	= ac200_tve_bridge_mode_set,
++	.enable		= ac200_tve_bridge_enable,
++	.disable	= ac200_tve_bridge_disable,
++};
++
++static int ac200_tve_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct nvmem_cell *cell;
++	struct ac200_tve *tve;
++	int ret;
++
++	tve = devm_kzalloc(dev, sizeof(*tve), GFP_KERNEL);
++	if (!tve)
++		return -ENOMEM;
++
++	tve->dev = dev;
++	tve->regmap = dev_get_regmap(dev->parent, NULL);
++	if (!tve->regmap)
++		return dev_err_probe(dev, -ENODEV, "No parent regmap\n");
++
++	cell = devm_nvmem_cell_get(dev, "tve_calib");
++	if (IS_ERR(cell)) {
++		if (PTR_ERR(cell) == -EPROBE_DEFER)
++			return -EPROBE_DEFER;
++		dev_warn(dev, "No DAC calibration, using default\n");
++	} else {
++		size_t len;
++		u8 *buf = nvmem_cell_read(cell, &len);
++
++		/*
++		 * The H6 SID stores the value in the upper half of the
++		 * 32-bit word at 0x2c, which is what the cell points to.
++		 */
++		if (!IS_ERR(buf)) {
++			if (len == 4)
++				tve->dac_calib = get_unaligned_le32(buf) >> 16;
++			else if (len == 2)
++				tve->dac_calib = get_unaligned_le16(buf);
++			kfree(buf);
++		}
++	}
++	dev_info(dev, "DAC calibration 0x%x\n", tve->dac_calib);
++
++	tve->bridge.funcs = &ac200_tve_bridge_funcs;
++	tve->bridge.of_node = dev->of_node;
++	tve->bridge.type = DRM_MODE_CONNECTOR_Composite;
++
++	platform_set_drvdata(pdev, tve);
++
++	ret = devm_drm_bridge_add(dev, &tve->bridge);
++	if (ret)
++		return dev_err_probe(dev, ret, "Failed to add bridge\n");
++
++	dev_info(dev, "AC200 TV encoder registered\n");
++
++	return 0;
++}
++
++static const struct of_device_id ac200_tve_of_match[] = {
++	{ .compatible = "x-powers,ac200-tve" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, ac200_tve_of_match);
++
++static struct platform_driver ac200_tve_driver = {
++	.probe = ac200_tve_probe,
++	.driver = {
++		.name = "ac200-tve",
++		.of_match_table = ac200_tve_of_match,
++	},
++};
++module_platform_driver(ac200_tve_driver);
++
++MODULE_DESCRIPTION("X-Powers AC200 TV encoder driver");
++MODULE_LICENSE("GPL");
+-- 
+2.56.0
+
